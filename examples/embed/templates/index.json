@@ -1,0 +1,14 @@
+{
+  "type": "page",
+  "title": "{{ .Title }}",
+  "body": [
+    "{{ include \"header.json\" }}",
+    {
+      "type": "table",
+      "columns": [
+        { "name": "name", "label": "名称" }
+      ],
+      "data": "{{ json .Items }}"
+    }
+  ]
+}
