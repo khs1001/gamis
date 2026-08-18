@@ -91,16 +91,19 @@ func main() {
 
 ```go
 func New(opts ...Option) *Engine
-func WithFS(fsys fs.FS) Option          // os.DirFS / embed.FS
+func WithFS(fsys fs.FS) Option          // os.DirFS / embed.FS，挂载到命名空间根
+func WithFSAt(prefix string, fsys fs.FS) Option // 挂载到指定路径前缀下
 func WithFuncs(f template.FuncMap) Option
 func WithCompact() Option               // 默认缩进输出，此开关切换为紧凑 JSON
 
 func (e *Engine) Render(name string, data any) ([]byte, error)
 func (e *Engine) Parse() error          // 预解析全部 .json 模板并校验（可选）
+func (e *Engine) AddFS(prefix string, fsys fs.FS) // 运行时注册/替换文件系统
 ```
 
 - `Render`：渲染指定模板，返回校验过的合法 JSON。模板懒加载并缓存。
-- `Parse`：遍历 `fs.FS` 下所有 `.json` 模板做预解析与校验，可用于启动期预热。
+- `Parse`：遍历所有已挂载文件系统下的 `.json` 模板做预解析与校验，可用于启动期预热。
+- `AddFS`：运行期挂载或替换文件系统（替换时自动失效该前缀下的模板缓存），并发安全。
 
 ## 模板语法
 
@@ -208,6 +211,29 @@ gamis.New(gamis.WithFS(os.DirFS("templates")))
 var templatesFS embed.FS
 gamis.New(gamis.WithFS(templatesFS)) // Render("templates/index.json", ...)
 ```
+
+### 多个文件系统（挂载）
+
+不同的模板来源可挂载到不同路径前缀下，模板名按「最长前缀优先」解析：
+
+```go
+eng := gamis.New(
+	gamis.WithFS(os.DirFS("templates")),                  // 根挂载（兜底）
+	gamis.WithFSAt("pages", os.DirFS("pages")),           // 页面模板
+	gamis.WithFSAt("shared", templatesEmbedded),          // 共享片段（go:embed）
+	gamis.WithFSAt("admin", adminFS),                     // 后台模板
+)
+
+// 模板名 = 前缀 + 文件路径
+eng.Render("pages/index.json", data)
+eng.Render("admin/users.json", data)
+eng.Render("index.json", data) // 未命中前缀，回落到根挂载
+```
+
+- `WithFS(fsys)` 等价于 `WithFSAt("", fsys)`，是兜底挂载；重复调用会替换根挂载
+- `AddFS(prefix, fsys)` 可在**运行时**注册或替换文件系统，替换时自动失效该前缀下的模板缓存，并发安全
+- `include` 可跨挂载引用，如 `{{ include "../shared/header.json" }}`；路径不能越出命名空间根
+- 挂载前缀不可包含 `..`、不能以 `/` 开头（非法前缀会 panic）
 
 ## 限制
 

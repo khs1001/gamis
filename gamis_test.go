@@ -222,3 +222,128 @@ func TestFuncMapNotSharedAcrossEngines(t *testing.T) {
 	got := mustRender(t, e1, "index.json", map[string]any{"S": "abc"})
 	eq(t, got, mustJSON(t, `{"s":"ABC"}`))
 }
+
+func TestMultiFS(t *testing.T) {
+	pages := fstest.MapFS{}
+	pages["index.json"] = &fstest.MapFile{Data: []byte(`{"src":"pages"}`)}
+	admin := fstest.MapFS{}
+	admin["index.json"] = &fstest.MapFile{Data: []byte(`{"src":"admin"}`)}
+	admin["form.json"] = &fstest.MapFile{Data: []byte(`{"type":"form"}`)}
+
+	e := New(WithFSAt("pages", pages), WithFSAt("admin", admin))
+
+	got := mustRender(t, e, "pages/index.json", nil)
+	eq(t, got, mustJSON(t, `{"src":"pages"}`))
+	got = mustRender(t, e, "admin/index.json", nil)
+	eq(t, got, mustJSON(t, `{"src":"admin"}`))
+	got = mustRender(t, e, "admin/form.json", nil)
+	eq(t, got, mustJSON(t, `{"type":"form"}`))
+
+	if _, err := e.Render("index.json", nil); err == nil {
+		t.Fatal("expected error for name without a mounted prefix")
+	}
+}
+
+func TestMountPrecedence(t *testing.T) {
+	root := fstest.MapFS{}
+	root["index.json"] = &fstest.MapFile{Data: []byte(`{"src":"root"}`)}
+	root["other/index.json"] = &fstest.MapFile{Data: []byte(`{"src":"root-other"}`)}
+	pages := fstest.MapFS{}
+	pages["index.json"] = &fstest.MapFile{Data: []byte(`{"src":"pages"}`)}
+
+	e := New(WithFS(root), WithFSAt("pages", pages))
+
+	// longest prefix wins
+	eq(t, mustRender(t, e, "pages/index.json", nil), mustJSON(t, `{"src":"pages"}`))
+	// names not covered by a prefix fall back to the root mount
+	eq(t, mustRender(t, e, "index.json", nil), mustJSON(t, `{"src":"root"}`))
+	eq(t, mustRender(t, e, "other/index.json", nil), mustJSON(t, `{"src":"root-other"}`))
+}
+
+func TestWithFSReplacesRoot(t *testing.T) {
+	rootA := fstest.MapFS{}
+	rootA["index.json"] = &fstest.MapFile{Data: []byte(`{"src":"A"}`)}
+	rootB := fstest.MapFS{}
+	rootB["index.json"] = &fstest.MapFile{Data: []byte(`{"src":"B"}`)}
+
+	e := New(WithFS(rootA), WithFS(rootB))
+	eq(t, mustRender(t, e, "index.json", nil), mustJSON(t, `{"src":"B"}`))
+}
+
+func TestCrossMountInclude(t *testing.T) {
+	pages := fstest.MapFS{}
+	pages["index.json"] = &fstest.MapFile{Data: []byte(`{"x":"{{ include \"../shared/header.json\" }}"}`)}
+	shared := fstest.MapFS{}
+	shared["header.json"] = &fstest.MapFile{Data: []byte(`{"shared":"{{ .V }}"}`)}
+
+	e := New(WithFSAt("pages", pages), WithFSAt("shared", shared))
+	got := mustRender(t, e, "pages/index.json", map[string]any{"V": 1})
+	eq(t, got, mustJSON(t, `{"x":{"shared":1}}`))
+}
+
+func TestAddFS(t *testing.T) {
+	e := New()
+	if _, err := e.Render("pages/index.json", nil); err == nil {
+		t.Fatal("expected error before any mount")
+	}
+
+	v1 := fstest.MapFS{}
+	v1["index.json"] = &fstest.MapFile{Data: []byte(`{"v":1}`)}
+	e.AddFS("pages", v1)
+	eq(t, mustRender(t, e, "pages/index.json", nil), mustJSON(t, `{"v":1}`))
+
+	// re-registering the prefix replaces the filesystem
+	v2 := fstest.MapFS{}
+	v2["index.json"] = &fstest.MapFile{Data: []byte(`{"v":2}`)}
+	e.AddFS("pages", v2)
+	eq(t, mustRender(t, e, "pages/index.json", nil), mustJSON(t, `{"v":2}`))
+}
+
+func TestAddFSConcurrent(t *testing.T) {
+	e := New(WithFSAt("pages", fstest.MapFS{
+		"index.json": &fstest.MapFile{Data: []byte(`{"v":"{{ .V }}"}`)},
+	}))
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			out, err := e.Render("pages/index.json", map[string]any{"V": "x"})
+			if err != nil {
+				t.Errorf("Render: %v", err)
+				return
+			}
+			if !json.Valid(out) {
+				t.Errorf("invalid json: %q", out)
+			}
+		}()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			e.AddFS("pages", fstest.MapFS{
+				"index.json": &fstest.MapFile{Data: []byte(`{"v":"{{ .V }}"}`)},
+			})
+		}()
+	}
+	wg.Wait()
+}
+
+func TestParseMultiFS(t *testing.T) {
+	ok := fstest.MapFS{}
+	ok["x.json"] = &fstest.MapFile{Data: []byte(`{}`)}
+	bad := fstest.MapFS{}
+	bad["y.json"] = &fstest.MapFile{Data: []byte(`{"a":`)}
+	e := New(WithFSAt("a", ok), WithFSAt("b", bad))
+	if err := e.Parse(); err == nil {
+		t.Fatal("expected Parse to fail on invalid template in second mount")
+	}
+}
+
+func TestInvalidMountPrefix(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for invalid mount prefix")
+		}
+	}()
+	New(WithFSAt("../escape", fstest.MapFS{}))
+}
